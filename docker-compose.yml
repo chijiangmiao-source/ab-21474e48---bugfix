@@ -1,0 +1,43 @@
+# 低温阵列扫描监控 —— 编排
+#
+#   docker compose up app        # 启动应用（默认宿主机端口 8080）
+#   HOST_PORT=9000 docker compose up app   # 自定义宿主机端口
+#   docker compose run --rm verify          # 执行复核，退出码即结果
+#   docker compose up --abort-on-container-exit --exit-code-from verify verify
+name: cryo-array
+
+services:
+  app:
+    build: .
+    image: cryo-array-app
+    environment:
+      PORT: 8080
+      DB_PATH: /srv/data/app.db
+    volumes:
+      - app-data:/srv/data
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=2).status==200 else 1)"
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  verify:
+    image: cryo-array-app
+    build: .
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: http://app:8080
+    command: ["sh", "verify/run_verify.sh"]
+    restart: "no"
+
+volumes:
+  app-data:

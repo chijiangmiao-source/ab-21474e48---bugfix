@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>低温阵列扫描监控</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>低温阵列扫描监控</h1>
+    <div id="conn-status" class="badge badge-idle">未连接</div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>当前采集代</h2>
+      <dl class="meta">
+        <div><dt>代号</dt><dd id="gen-code">—</dd></div>
+        <div><dt>高水位（连续序号）</dt><dd id="high-water">0</dd></div>
+      </dl>
+      <div class="actions">
+        <button id="btn-new-gen" type="button">新开采集</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>追加校正帧</h2>
+      <div class="field">
+        <label for="op-id">操作标识</label>
+        <input id="op-id" type="text" autocomplete="off" />
+        <button id="btn-regen-op" type="button" title="随机生成新操作标识">随机</button>
+      </div>
+      <div id="delta-rows"></div>
+      <div class="actions">
+        <button id="btn-add-row" type="button">＋ 通道</button>
+        <button id="btn-append" type="button" class="primary">追加帧</button>
+        <button id="btn-replay" type="button" disabled>重发上次帧（幂等）</button>
+      </div>
+      <p class="hint">同一操作标识 + 相同参数重试将返回原序号；异参复用会被稳定拒绝。</p>
+    </section>
+
+    <section class="panel">
+      <h2>通道累计值</h2>
+      <table id="totals-table">
+        <thead><tr><th>通道</th><th>累计值</th></tr></thead>
+        <tbody><tr class="empty"><td colspan="2">暂无数据</td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>最近帧</h2>
+      <table id="frames-table">
+        <thead><tr><th>序号</th><th>操作标识</th><th>通道增量 / 帧后累计</th></tr></thead>
+        <tbody><tr class="empty"><td colspan="3">暂无帧</td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>事件日志</h2>
+      <ul id="event-log" class="log"></ul>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

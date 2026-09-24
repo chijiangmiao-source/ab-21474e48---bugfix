@@ -1,0 +1,6 @@
+.git
+__pycache__
+*.pyc
+frontend/dist
+data
+.DS_Store
