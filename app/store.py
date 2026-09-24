@@ -128,12 +128,51 @@ class Store:
                     operation_id TEXT NOT NULL,
                     params_hash TEXT NOT NULL,
                     payload TEXT NOT NULL,
+                    totals TEXT,
                     created_at REAL NOT NULL,
                     UNIQUE (acquisition_id, seq),
                     UNIQUE (acquisition_id, operation_id)
                 );
                 """
             )
+            # 旧库迁移：逐帧累计值在追加时前向计算并落库，读取时不再反向重算
+            # （反向减法在大小量级混用时会丢失浮点精度，且无法恢复被压缩帧的贡献）。
+            columns = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(frames)")
+            }
+            if "totals" not in columns:
+                self._conn.execute("ALTER TABLE frames ADD COLUMN totals TEXT")
+                self._backfill_legacy_frame_totals()
+
+    def _backfill_legacy_frame_totals(self) -> None:
+        """版本迁移：为旧版写入、totals 为空的帧回填逐帧累计。
+
+        依据当前快照对留存帧反向减增量后再前向累加；已被压缩帧造成的精度损失
+        无法追溯，仅保证与旧版展示一致，迁移后的新追加帧始终精确落库。
+        """
+        rows = self._conn.execute(
+            "SELECT f.acquisition_id AS aid, f.seq AS seq, f.payload AS payload,"
+            " s.totals AS snap_totals FROM frames f JOIN snapshots s"
+            " ON s.acquisition_id=f.acquisition_id WHERE f.totals IS NULL"
+            " ORDER BY f.acquisition_id, f.seq"
+        ).fetchall()
+        by_acq: dict = {}
+        for row in rows:
+            by_acq.setdefault(row["aid"], []).append(row)
+        for aid, acq_rows in by_acq.items():
+            running = json.loads(acq_rows[0]["snap_totals"])
+            parsed = [(r["seq"], json.loads(r["payload"])) for r in acq_rows]
+            for _, deltas in reversed(parsed):
+                for name, value in deltas.items():
+                    running[name] = running.get(name, 0) - value
+            for seq, deltas in parsed:
+                for name, value in deltas.items():
+                    running[name] = running.get(name, 0) + value
+                self._conn.execute(
+                    "UPDATE frames SET totals=? WHERE acquisition_id=? AND seq=?",
+                    (canonical_payload(dict(running)), aid, seq),
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -246,8 +285,17 @@ class Store:
 
                 self._conn.execute(
                     "INSERT INTO frames(acquisition_id, seq, operation_id,"
-                    " params_hash, payload, created_at) VALUES (?,?,?,?,?,?)",
-                    (acq["id"], seq, operation_id, params_hash, payload, time.time()),
+                    " params_hash, payload, totals, created_at)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    (
+                        acq["id"],
+                        seq,
+                        operation_id,
+                        params_hash,
+                        payload,
+                        canonical_payload(totals),
+                        time.time(),
+                    ),
                 )
                 self._conn.execute(
                     "UPDATE snapshots SET high_water=?, totals=? WHERE acquisition_id=?",
@@ -276,14 +324,27 @@ class Store:
 
     def _retained_frames(self, acquisition_id: int, totals: dict) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT seq, operation_id, payload FROM frames"
+            "SELECT seq, operation_id, payload, totals FROM frames"
             " WHERE acquisition_id=? ORDER BY seq ASC",
             (acquisition_id,),
         ).fetchall()
-        parsed = [
-            (row, json.loads(row["payload"]))
-            for row in rows
-        ]
+        parsed = [(row, json.loads(row["payload"])) for row in rows]
+
+        # 正常路径：逐帧累计值在追加事务内前向计算并持久化，直接读取即可。
+        # 不能从最终汇总反向减增量重算：大小量级混用时浮点减法会丢精度，
+        # 被压缩帧对稀疏通道的贡献也无法这样恢复。
+        if rows and all(row["totals"] is not None for row in rows):
+            return [
+                {
+                    "seq": row["seq"],
+                    "operationId": row["operation_id"],
+                    "deltas": deltas,
+                    "totals": json.loads(row["totals"]),
+                }
+                for row, deltas in parsed
+            ]
+
+        # 兼容迁移前写入的旧帧（totals 为 NULL）：仅尽力反向重算。
         running = dict(totals)
         for _, deltas in reversed(parsed):
             for name, value in deltas.items():

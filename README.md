@@ -42,7 +42,8 @@ docker compose up --abort-on-container-exit --exit-code-from verify verify
 verify 依次执行并以退出码报告结果（0 通过 / 非 0 失败）：
 
 1. **代码测试** `python -m unittest discover -s tests -v` —— 持久层单元测试 +
-   HTTP/SSE 集成测试（幂等、冲突、压缩、并发、代际隔离、重置等 17 项）；
+   HTTP/SSE 集成测试（幂等、冲突、压缩、并发、代际隔离、重置、
+   稀疏帧压缩后逐帧累计精确等 19 项）；
 2. **前端构建检查** `node frontend/build.mjs --check` —— JS 语法编译校验 +
    资源引用与 dist 产物完整性；
 3. **API/HTTP 冒烟** `python verify/smoke.py` —— 对 `app` 服务的端到端检查

@@ -204,6 +204,60 @@ def main():
     finally:
         client.close()
 
+    # 稀疏帧 + 极端量级：被压缩的首帧不得污染恢复后的逐帧累计轨迹
+    status, sparse_gen = http_json("POST", "/api/acquisitions")
+    check("稀疏场景新开采集", status == 201 and bool(sparse_gen.get("code")),
+          f"status={status}")
+    scode = sparse_gen["code"]
+    huge = -10_000_000_000_000_000
+    status, f1 = http_json("POST", f"/api/acquisitions/{scode}/frames",
+                           {"operationId": "sparse-sig-1", "deltas": {"signal": 10000.5}})
+    check("稀疏首帧序号 1", status == 201 and f1.get("seq") == 1, f"status={status}")
+    for i in range(31):
+        http_json("POST", f"/api/acquisitions/{scode}/frames",
+                  {"operationId": f"sparse-mon-{i}", "deltas": {"monitor": 1}})
+    http_json("POST", f"/api/acquisitions/{scode}/frames",
+              {"operationId": "sparse-sig-2", "deltas": {"signal": 0.5}})
+    http_json("POST", f"/api/acquisitions/{scode}/frames",
+              {"operationId": "sparse-sig-3", "deltas": {"signal": huge}})
+    final_totals = {"monitor": 31, "signal": -9_999_999_999_990_000.0}
+
+    def check_trajectory(name, payload):
+        frames = payload.get("frames") or []
+        by_seq = {f.get("seq"): f for f in frames}
+        ok = (
+            payload.get("highWater") == 34
+            and payload.get("totals") == final_totals
+            and [f.get("seq") for f in frames] == list(range(3, 35))
+            and by_seq.get(33, {}).get("totals", {}).get("signal") == 10001.0
+            and by_seq.get(34, {}).get("totals") == final_totals
+        )
+        check(name, ok, f"payload={payload}")
+
+    client = SSEClient(f"/api/acquisitions/{scode}/stream")
+    try:
+        check_trajectory("稀疏场景首次快照累计轨迹精确", client.read_event()["data"])
+    finally:
+        client.close()
+    client = SSEClient(f"/api/acquisitions/{scode}/stream?cursor=1")
+    try:
+        ev = client.read_event()
+        check("稀疏场景过期游标触发重置",
+              ev.get("event") == "reset"
+              and ev["data"].get("reason") == "cursor_expired", f"event={ev}")
+        check_trajectory("稀疏场景重置累计轨迹精确", ev["data"])
+        status, fc = http_json("POST", f"/api/acquisitions/{scode}/frames",
+                               {"operationId": "sparse-cont", "deltas": {"signal": 1}})
+        ev = client.read_event()
+        check("稀疏场景重置后增量从序号 35 衔接",
+              status == 201 and fc.get("seq") == 35
+              and ev.get("event") == "frame" and ev["data"].get("seq") == 35
+              and ev["data"].get("totals")
+              == {"monitor": 31, "signal": -9_999_999_999_989_999.0},
+              f"status={status} ev={ev}")
+    finally:
+        client.close()
+
     # 代际隔离：新开一代后旧代拒绝追加，旧流收到 superseded
     old_stream = SSEClient(f"/api/acquisitions/{code}/stream")
     try:

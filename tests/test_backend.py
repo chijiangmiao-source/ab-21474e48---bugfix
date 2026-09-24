@@ -215,6 +215,53 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(self.store.get_snapshot(code).high_water, 1)
         self.assertEqual(self.store.get_snapshot(code).totals["ch0"], 3)
 
+    def test_sparse_frames_keep_exact_cumulative_after_compaction(self):
+        """稀疏通道 + 极端量级：帧 1 被压缩后，逐帧累计仍须精确。
+
+        反向从最终汇总减增量会因浮点精度丢失把序号 33 的 signal 重算成 10000；
+        逐帧累计必须在追加时前向落库，压缩、首次快照、过期游标重置看到同一条轨迹。
+        """
+        code, _ = self.store.create_acquisition()
+        self.store.append_frame(code, "op-sig-1", {"signal": 10000.5})  # 序号 1
+        for i in range(31):  # 序号 2..32：monitor 每帧 +1
+            self.store.append_frame(code, f"op-mon-{i}", {"monitor": 1})
+        self.store.append_frame(code, "op-sig-2", {"signal": 0.5})  # 序号 33
+        huge = -10_000_000_000_000_000
+        self.store.append_frame(code, "op-sig-3", {"signal": huge})  # 序号 34
+
+        snap = self.store.get_snapshot(code)
+        self.assertEqual(snap.high_water, 34)
+        self.assertEqual(snap.totals,
+                         {"monitor": 31, "signal": -9_999_999_999_990_000.0})
+        # 最近帧恰好覆盖序号 3..34，顺序连续
+        seqs = [f["seq"] for f in snap.frames]
+        self.assertEqual(seqs, list(range(3, 35)))
+        by_seq = {f["seq"]: f for f in snap.frames}
+        self.assertEqual(by_seq[32]["totals"],
+                         {"monitor": 31, "signal": 10000.5})
+        self.assertEqual(by_seq[33]["totals"],
+                         {"monitor": 31, "signal": 10001.0})
+        self.assertEqual(by_seq[34]["totals"],
+                         {"monitor": 31, "signal": -9_999_999_999_990_000.0})
+
+        # 过期游标路径（frames_after）与首次快照看到同一条轨迹
+        frames, lo = self.store.frames_after(code, 1)
+        self.assertEqual(lo, 3)
+        self.assertEqual([f["seq"] for f in frames], list(range(3, 35)))
+        self.assertEqual(frames[seqs.index(33)]["totals"]["signal"], 10001.0)
+
+        # 继续追加从序号 35 和现有权威汇总继续，窗口滚动为 4..35
+        cont = self.store.append_frame(code, "op-cont", {"signal": 1})
+        self.assertEqual(cont.seq, 35)
+        self.assertEqual(cont.totals,
+                         {"monitor": 31, "signal": -9_999_999_999_989_999.0})
+        snap2 = self.store.get_snapshot(code)
+        self.assertEqual([f["seq"] for f in snap2.frames], list(range(4, 36)))
+        self.assertEqual(snap2.frames[-1]["totals"], cont.totals)
+        # 已落库帧的历史累计不随后续追加改变
+        self.assertEqual({f["seq"]: f["totals"] for f in snap2.frames}[33],
+                         {"monitor": 31, "signal": 10001.0})
+
 
 # ------------------------------------------------------------------ HTTP/SSE
 
@@ -354,6 +401,84 @@ class HttpTest(unittest.TestCase):
             self.assertEqual(ev["data"]["highWater"], RETENTION + 10)
         finally:
             client.close()
+
+    def test_sparse_frames_snapshot_reset_and_incremental_share_trajectory(self):
+        """端到端复现：序号 1 的 signal 帧被压缩 + 帧 34 的极端负增量后，
+        首次快照与游标 1 的重置事件必须看到同一条精确累计轨迹，后续增量继续衔接。"""
+        code = self.fx.new_gen()
+        huge = -10_000_000_000_000_000
+
+        def append(op, deltas):
+            status, data = self.fx.post(
+                f"/api/acquisitions/{code}/frames",
+                {"operationId": op, "deltas": deltas})
+            self.assertEqual(status, 201, data)
+            return data
+
+        append("op-sig-1", {"signal": 10000.5})  # 序号 1
+        for i in range(31):
+            append(f"op-mon-{i}", {"monitor": 1})  # 序号 2..32
+        append("op-sig-2", {"signal": 0.5})  # 序号 33
+        append("op-sig-3", {"signal": huge})  # 序号 34
+
+        expected_final = {"monitor": 31, "signal": -9_999_999_999_990_000.0}
+
+        def assert_trajectory(payload):
+            self.assertEqual(payload["highWater"], 34)
+            self.assertEqual(payload["totals"], expected_final)
+            frames = payload["frames"]
+            self.assertEqual([f["seq"] for f in frames], list(range(3, 35)))
+            by_seq = {f["seq"]: f for f in frames}
+            self.assertEqual(by_seq[32]["totals"],
+                             {"monitor": 31, "signal": 10000.5})
+            self.assertEqual(by_seq[33]["totals"],
+                             {"monitor": 31, "signal": 10001.0})
+            self.assertEqual(by_seq[34]["totals"], expected_final)
+
+        # 首次连接：直接读同一代快照
+        client = SSEClient(self.fx.port, f"/api/acquisitions/{code}/stream")
+        try:
+            ev = client.read_event()
+            self.assertEqual(ev["event"], "snapshot")
+            assert_trajectory(ev["data"])
+        finally:
+            client.close()
+
+        # 以游标 1 重连：前两帧超出最近 32 帧窗口 -> 完整重置，轨迹相同
+        client = SSEClient(self.fx.port,
+                           f"/api/acquisitions/{code}/stream?cursor=1")
+        try:
+            ev = client.read_event()
+            self.assertEqual(ev["event"], "reset")
+            self.assertEqual(ev["data"]["reason"], "cursor_expired")
+            assert_trajectory(ev["data"])
+
+            # 重置后停留于同一条流，继续追加应收到序号 35 的增量
+            status, data = self.fx.post(
+                f"/api/acquisitions/{code}/frames",
+                {"operationId": "op-cont", "deltas": {"signal": 1}})
+            self.assertEqual(status, 201)
+            self.assertEqual(data["seq"], 35)
+            ev = client.read_event()
+            self.assertEqual(ev["event"], "frame")
+            self.assertEqual(ev["id"], "35")
+            self.assertEqual(ev["data"]["seq"], 35)
+            self.assertEqual(ev["data"]["deltas"], {"signal": 1})
+            self.assertEqual(
+                ev["data"]["totals"],
+                {"monitor": 31, "signal": -9_999_999_999_989_999.0},
+            )
+        finally:
+            client.close()
+
+        # 幂等：追加接口对已提交操作仍返回原序号，不产生新帧
+        status, data = self.fx.post(
+            f"/api/acquisitions/{code}/frames",
+            {"operationId": "op-cont", "deltas": {"signal": 1}})
+        self.assertEqual(status, 200)
+        self.assertTrue(data["replayed"])
+        self.assertEqual(data["seq"], 35)
+        self.assertEqual(data["highWater"], 35)
 
     def test_generation_isolation(self):
         old_code = self.fx.new_gen()
