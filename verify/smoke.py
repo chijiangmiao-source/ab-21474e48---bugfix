@@ -223,6 +223,81 @@ def main():
     finally:
         old_stream.close()
 
+    # 稀疏帧 + 大小量级混合：首次快照、过期游标重置、后续增量必须是同一条累计轨迹
+    status, gen3 = http_json("POST", "/api/acquisitions")
+    sparse = gen3["code"]
+
+    def sparse_append(op, deltas):
+        s, d = http_json("POST", f"/api/acquisitions/{sparse}/frames",
+                         {"operationId": op, "deltas": deltas})
+        check(f"稀疏帧 {op} 受理", s == 201, f"status={s} body={d}")
+        return d
+
+    sparse_append("sparse-sig-init", {"signal": 10000.5})      # seq 1
+    for i in range(RETENTION - 1):                             # seq 2..32
+        sparse_append(f"sparse-mon-{i:02d}", {"monitor": 1})
+    sparse_append("sparse-sig-half", {"signal": 0.5})          # seq 33
+    last = sparse_append("sparse-sig-huge",
+                         {"signal": -10_000_000_000_000_000})  # seq 34
+    final_totals = {"signal": -9_999_999_999_990_000, "monitor": 31}
+    check("稀疏帧最终汇总正确", last.get("seq") == 34 and last.get("totals") == final_totals,
+          f"last={last}")
+
+    def check_trajectory(payload, where):
+        frames = payload.get("frames", [])
+        seqs = [f.get("seq") for f in frames]
+        by_seq = {f.get("seq"): f for f in frames}
+        ok = (
+            payload.get("highWater") == 34
+            and payload.get("totals") == final_totals
+            and seqs == list(range(3, 35))
+            and by_seq.get(33, {}).get("totals", {}).get("signal") == 10001
+            and by_seq.get(33, {}).get("totals", {}).get("monitor") == 31
+            and by_seq.get(34, {}).get("totals") == final_totals
+        )
+        check(f"{where}累计轨迹一致（seq3..34 连续，seq33 signal=10001）", ok,
+              f"seqs={seqs[:3]}...{seqs[-3:]} f33={by_seq.get(33)} f34={by_seq.get(34)}")
+
+    client = SSEClient(f"/api/acquisitions/{sparse}/stream")
+    try:
+        ev = client.read_event()
+        check("稀疏场景首次连接发快照", ev.get("event") == "snapshot", f"event={ev.get('event')}")
+        check_trajectory(ev.get("data", {}), "首次快照")
+    finally:
+        client.close()
+
+    client = SSEClient(f"/api/acquisitions/{sparse}/stream?cursor=1")
+    try:
+        ev = client.read_event()
+        check("稀疏场景断链游标 1 触发重置",
+              ev.get("event") == "reset" and ev["data"].get("reason") == "cursor_expired",
+              f"event={ev.get('event')}")
+        check_trajectory(ev.get("data", {}), "过期重置")
+
+        # 重置后继续追加：序号 35 与权威汇总延续
+        s, d = http_json("POST", f"/api/acquisitions/{sparse}/frames",
+                         {"operationId": "sparse-continue", "deltas": {"monitor": 1}})
+        check("重置后从序号 35 继续", s == 201 and d.get("seq") == 35
+              and d.get("totals", {}).get("monitor") == 32
+              and d.get("totals", {}).get("signal") == -9_999_999_999_990_000,
+              f"status={s} body={d}")
+        ev = client.read_event()
+        check("重置连接收到 seq35 增量", ev.get("event") == "frame"
+              and ev["data"].get("seq") == 35
+              and ev["data"].get("totals", {}).get("monitor") == 32, f"event={ev}")
+    finally:
+        client.close()
+
+    # 稀疏场景下的追加幂等性：同参重放不产生新帧，异参复用稳定拒绝
+    s, d = http_json("POST", f"/api/acquisitions/{sparse}/frames",
+                     {"operationId": "sparse-sig-half", "deltas": {"signal": 0.5}})
+    check("稀疏帧同参重放返回原序号", s == 200 and d.get("replayed") and d.get("seq") == 33,
+          f"status={s} body={d}")
+    s, d = http_json("POST", f"/api/acquisitions/{sparse}/frames",
+                     {"operationId": "sparse-sig-half", "deltas": {"signal": 2.5}})
+    check("稀疏帧异参复用稳定拒绝", s == 409 and d.get("error") == "operation_conflict",
+          f"status={s} body={d}")
+
     if _failures:
         print(f"\n冒烟复核失败 {len(_failures)} 项: {', '.join(_failures)}", flush=True)
         return 1

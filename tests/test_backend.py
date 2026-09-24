@@ -20,6 +20,7 @@ from store import (  # noqa: E402
     NotFoundError,
     RETENTION,
     Store,
+    canonical_payload,
 )
 
 
@@ -215,6 +216,138 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(self.store.get_snapshot(code).high_water, 1)
         self.assertEqual(self.store.get_snapshot(code).totals["ch0"], 3)
 
+    def test_sparse_wide_magnitude_trajectory_is_exact(self):
+        """稀疏帧 + 极大/极小增量混合：固化的逐帧累计必须与正向累计完全一致。"""
+        code, _ = self.store.create_acquisition()
+        # seq 1：signal +10000.5（页面新开一代后收到的第一帧）
+        self.store.append_frame(code, "sig-init", {"signal": 10000.5})
+        # seq 2..32：monitor 连续 31 次 +1（事件流中断期间经同代追加接口写入）
+        for i in range(RETENTION - 1):
+            self.store.append_frame(code, f"mon-{i:02d}", {"monitor": 1})
+        # seq 33：signal +0.5
+        self.store.append_frame(code, "sig-half", {"signal": 0.5})
+        # seq 34：signal -10000000000000000
+        self.store.append_frame(code, "sig-huge", {"signal": -10_000_000_000_000_000})
+
+        snap = self.store.get_snapshot(code)
+        self.assertEqual(snap.high_water, 34)
+        # 权威汇总：看似一直正确
+        self.assertEqual(snap.totals["signal"], -9_999_999_999_990_000)
+        self.assertEqual(snap.totals["monitor"], 31)
+
+        # 留存窗口恰好覆盖序号 3..34，连续不重放
+        seqs = [f["seq"] for f in snap.frames]
+        self.assertEqual(seqs, list(range(3, 35)))
+        by_seq = {f["seq"]: f for f in snap.frames}
+        # 关键回归点：seq 33 的 signal 累计必须是 10001，而非浮点抵消后的 10000
+        self.assertEqual(by_seq[33]["totals"]["signal"], 10001)
+        self.assertEqual(by_seq[33]["totals"]["monitor"], 31)
+        # seq 34 最终值
+        self.assertEqual(by_seq[34]["totals"]["signal"], -9_999_999_999_990_000)
+        self.assertEqual(by_seq[34]["totals"]["monitor"], 31)
+        # 窗口起点 seq 3：signal 未变，monitor 已累计 seq 2、3 两次 +1
+        self.assertEqual(by_seq[3]["totals"], {"signal": 10000.5, "monitor": 2})
+        # monitor 逐帧累计：seq i（2..32 留存部分从 3 起）为 i-1
+        for i in range(3, 33):
+            self.assertEqual(by_seq[i]["totals"]["monitor"], i - 1)
+
+        # frames_after 与快照同源
+        frames, lo = self.store.frames_after(code, 1)
+        self.assertEqual(lo, 3)
+        self.assertEqual([f["seq"] for f in frames], list(range(3, 35)))
+        self.assertEqual(frames[30]["totals"]["signal"], 10001)  # seq 33
+
+        # 继续追加：从序号 35 与现有权威汇总继续
+        r = self.store.append_frame(code, "continue-1", {"monitor": 1})
+        self.assertEqual(r.seq, 35)
+        self.assertEqual(r.totals["monitor"], 32)
+        self.assertEqual(r.totals["signal"], -9_999_999_999_990_000)
+        snap2 = self.store.get_snapshot(code)
+        self.assertEqual(snap2.high_water, 35)
+        self.assertEqual([f["seq"] for f in snap2.frames], list(range(4, 36)))
+
+    def test_persisted_frame_totals_survive_reopen(self):
+        import os
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = Store(path)
+            code, _ = store.create_acquisition()
+            store.append_frame(code, "op-1", {"ch0": 10000.5})
+            for i in range(RETENTION + 2):
+                store.append_frame(code, f"op-{i+2}", {"ch0": 0.5})
+            store.close()
+
+            reopened = Store(path)
+            snap = reopened.get_snapshot(code)
+            self.assertEqual(snap.high_water, RETENTION + 3)
+            self.assertEqual(snap.totals["ch0"], 10000.5 + 0.5 * (RETENTION + 2))
+            # 固化的逐帧累计在重开后依旧精确，且末帧等于权威汇总
+            self.assertEqual(snap.frames[-1]["totals"]["ch0"], snap.totals["ch0"])
+            self.assertEqual(snap.frames[0]["seq"], 4)
+            reopened.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                if os.path.exists(path + suffix):
+                    os.unlink(path + suffix)
+
+    def test_legacy_schema_without_totals_column_backfills(self):
+        """旧库（frames 无 totals 列）打开时自动迁移并补填，末帧等于权威汇总。"""
+        import os
+        import sqlite3
+        import tempfile
+        import time
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            raw = sqlite3.connect(path)
+            raw.execute(
+                "CREATE TABLE acquisitions (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " code TEXT UNIQUE, status TEXT, created_at REAL)"
+            )
+            raw.execute(
+                "CREATE TABLE snapshots (acquisition_id INTEGER PRIMARY KEY,"
+                " high_water INTEGER, totals TEXT)"
+            )
+            raw.execute(
+                "CREATE TABLE frames (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " acquisition_id INTEGER, seq INTEGER, operation_id TEXT,"
+                " params_hash TEXT, payload TEXT, created_at REAL)"
+            )
+            raw.execute(
+                "INSERT INTO acquisitions(id, code, status, created_at)"
+                " VALUES (1, 'gen-legacy', 'active', ?)",
+                (time.time(),),
+            )
+            raw.execute(
+                "INSERT INTO snapshots(acquisition_id, high_water, totals)"
+                " VALUES (1, 3, ?)",
+                (canonical_payload({"ch0": 6}),),
+            )
+            for seq, value in ((1, 1), (2, 2), (3, 3)):
+                raw.execute(
+                    "INSERT INTO frames(acquisition_id, seq, operation_id,"
+                    " params_hash, payload, created_at) VALUES (1,?,?,?,?,?)",
+                    (seq, f"op-{seq}", "x", canonical_payload({"ch0": value}),
+                     time.time()),
+                )
+            raw.commit()
+            raw.close()
+
+            store = Store(path)
+            snap = store.get_snapshot("gen-legacy")
+            self.assertEqual(
+                [f["totals"]["ch0"] for f in snap.frames], [1, 3, 6]
+            )
+            store.close()
+        finally:
+            for suffix in ("", "-wal", "-shm"):
+                if os.path.exists(path + suffix):
+                    os.unlink(path + suffix)
+
 
 # ------------------------------------------------------------------ HTTP/SSE
 
@@ -354,6 +487,93 @@ class HttpTest(unittest.TestCase):
             self.assertEqual(ev["data"]["highWater"], RETENTION + 10)
         finally:
             client.close()
+
+    def test_sparse_frames_snapshot_reset_and_followup_agree(self):
+        """构造报告中的稀疏帧与断链游标：首次快照、过期游标重置、后续增量
+        必须看到同一条累计轨迹（seq 33 signal=10001，seq 34 为最终大负值）。"""
+        code = self.fx.new_gen()
+
+        def append(op, deltas):
+            status, data = self.fx.post(f"/api/acquisitions/{code}/frames",
+                                        {"operationId": op, "deltas": deltas})
+            assert status == 201, (status, data)
+            return data
+
+        append("sig-init", {"signal": 10000.5})               # seq 1
+        for i in range(RETENTION - 1):                        # seq 2..32
+            append(f"mon-{i:02d}", {"monitor": 1})
+        append("sig-half", {"signal": 0.5})                   # seq 33
+        append("sig-huge", {"signal": -10_000_000_000_000_000})  # seq 34
+
+        final_totals = {"signal": -9_999_999_999_990_000, "monitor": 31}
+
+        def assert_trajectory(payload):
+            self.assertEqual(payload["highWater"], 34)
+            self.assertEqual(payload["totals"], final_totals)
+            frames = payload["frames"]
+            seqs = [f["seq"] for f in frames]
+            self.assertEqual(seqs, list(range(3, 35)))  # 恰好 3..34，连续不重放
+            by_seq = {f["seq"]: f for f in frames}
+            self.assertEqual(by_seq[33]["totals"]["signal"], 10001)
+            self.assertEqual(by_seq[33]["totals"]["monitor"], 31)
+            self.assertEqual(by_seq[34]["totals"], final_totals)
+            # 逐帧 totals 与自身 deltas 自洽（留存窗口从 seq 3 起，
+            # 基值取 seq 2 末：signal 10000.5、monitor 1）
+            prev = {"signal": 10000.5, "monitor": 1}
+            for f in frames:
+                calc = dict(prev)
+                for k, v in f["deltas"].items():
+                    calc[k] = calc.get(k, 0) + v
+                self.assertEqual(f["totals"], calc, f"seq {f['seq']} 累计轨迹不自洽")
+                prev = calc
+
+        # 1) 首次连接直接读同一代快照
+        fresh = SSEClient(self.fx.port, f"/api/acquisitions/{code}/stream")
+        try:
+            ev = fresh.read_event()
+            self.assertEqual(ev["event"], "snapshot")
+            assert_trajectory(ev["data"])
+        finally:
+            fresh.close()
+
+        # 2) 页面以游标 1 重连：前两帧已超出最近 32 帧窗口 -> 完整重置
+        stale = SSEClient(self.fx.port, f"/api/acquisitions/{code}/stream?cursor=1")
+        try:
+            ev = stale.read_event()
+            self.assertEqual(ev["event"], "reset")
+            self.assertEqual(ev["data"]["reason"], "cursor_expired")
+            assert_trajectory(ev["data"])
+
+            # 3) 重置后继续增量：序号 35，从现有权威汇总继续
+            status, data = self.fx.post(
+                f"/api/acquisitions/{code}/frames",
+                {"operationId": "continue-mon", "deltas": {"monitor": 1}})
+            self.assertEqual(status, 201)
+            self.assertEqual(data["seq"], 35)
+            self.assertEqual(data["totals"]["monitor"], 32)
+            self.assertEqual(data["totals"]["signal"], -9_999_999_999_990_000)
+
+            ev = stale.read_event()
+            self.assertEqual(ev["event"], "frame")
+            self.assertEqual(ev["id"], "35")
+            self.assertEqual(ev["data"]["totals"]["monitor"], 32)
+            self.assertEqual(ev["data"]["totals"]["signal"], -9_999_999_999_990_000)
+        finally:
+            stale.close()
+
+        # 4) 有效游标补发缺口（游标 33 -> 34、35），补发轨迹同样精确
+        gap = SSEClient(self.fx.port, f"/api/acquisitions/{code}/stream?cursor=33")
+        try:
+            ev34 = gap.read_event()
+            self.assertEqual(ev34["event"], "frame")
+            self.assertEqual(ev34["data"]["seq"], 34)
+            self.assertEqual(ev34["data"]["totals"], final_totals)
+            ev35 = gap.read_event()
+            self.assertEqual(ev35["event"], "frame")
+            self.assertEqual(ev35["data"]["seq"], 35)
+            self.assertEqual(ev35["data"]["totals"]["monitor"], 32)
+        finally:
+            gap.close()
 
     def test_generation_isolation(self):
         old_code = self.fx.new_gen()

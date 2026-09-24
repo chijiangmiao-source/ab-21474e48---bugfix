@@ -128,12 +128,56 @@ class Store:
                     operation_id TEXT NOT NULL,
                     params_hash TEXT NOT NULL,
                     payload TEXT NOT NULL,
+                    totals TEXT,
                     created_at REAL NOT NULL,
                     UNIQUE (acquisition_id, seq),
                     UNIQUE (acquisition_id, operation_id)
                 );
                 """
             )
+            # 旧库迁移：逐帧累计值改为追加时固化（避免从最终汇总反向消减时
+            # 大数与小增量混合导致浮点灾难性抵消）。
+            frame_cols = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(frames)")
+            }
+            if "totals" not in frame_cols:
+                self._conn.execute("ALTER TABLE frames ADD COLUMN totals TEXT")
+                self._backfill_legacy_frame_totals()
+
+    def _backfill_legacy_frame_totals(self) -> None:
+        """为旧版本写入、缺少固化累计值的帧补填 totals（尽力而为）。
+
+        基值取“快照权威汇总减去留存帧增量之和”，再正向累计；正常量级数据与历史
+        行为一致，且最后一帧恰好等于权威汇总。极端大小量级混合的旧数据中间轨迹
+        无法从压缩后的留存帧精确复原（这正是旧实现的缺陷），新数据在追加时即
+        固化累计值，不再依赖此路径。
+        """
+        acq_rows = self._conn.execute("SELECT id FROM acquisitions").fetchall()
+        for acq in acq_rows:
+            snap = self._conn.execute(
+                "SELECT totals FROM snapshots WHERE acquisition_id=?", (acq["id"],)
+            ).fetchone()
+            if snap is None:
+                continue
+            base = json.loads(snap["totals"])
+            frame_rows = self._conn.execute(
+                "SELECT seq, payload FROM frames WHERE acquisition_id=? ORDER BY seq ASC",
+                (acq["id"],),
+            ).fetchall()
+            # 先扣除全部留存增量得到留存窗口起点前的基值
+            for row in frame_rows:
+                for name, value in json.loads(row["payload"]).items():
+                    base[name] = base.get(name, 0) - value
+            running = base
+            for row in frame_rows:
+                deltas = json.loads(row["payload"])
+                for name, value in deltas.items():
+                    running[name] = running.get(name, 0) + value
+                self._conn.execute(
+                    "UPDATE frames SET totals=? WHERE acquisition_id=? AND seq=?",
+                    (canonical_payload(running), acq["id"], row["seq"]),
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -246,8 +290,17 @@ class Store:
 
                 self._conn.execute(
                     "INSERT INTO frames(acquisition_id, seq, operation_id,"
-                    " params_hash, payload, created_at) VALUES (?,?,?,?,?,?)",
-                    (acq["id"], seq, operation_id, params_hash, payload, time.time()),
+                    " params_hash, payload, totals, created_at)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    (
+                        acq["id"],
+                        seq,
+                        operation_id,
+                        params_hash,
+                        payload,
+                        canonical_payload(totals),
+                        time.time(),
+                    ),
                 )
                 self._conn.execute(
                     "UPDATE snapshots SET high_water=?, totals=? WHERE acquisition_id=?",
@@ -274,31 +327,24 @@ class Store:
 
     # ------------------------------------------------------------------ 读取
 
-    def _retained_frames(self, acquisition_id: int, totals: dict) -> list[dict]:
+    def _retained_frames(self, acquisition_id: int) -> list[dict]:
+        """读取留存帧。每帧的 totals 是追加时正向累计并固化的值，
+        与快照权威汇总同源，无需（也不得）从最终汇总反向消减重建
+        —— 反向消减在大数量级与微小增量混合时会发生浮点灾难性抵消。"""
         rows = self._conn.execute(
-            "SELECT seq, operation_id, payload FROM frames"
+            "SELECT seq, operation_id, payload, totals FROM frames"
             " WHERE acquisition_id=? ORDER BY seq ASC",
             (acquisition_id,),
         ).fetchall()
-        parsed = [
-            (row, json.loads(row["payload"]))
-            for row in rows
-        ]
-        running = dict(totals)
-        for _, deltas in reversed(parsed):
-            for name, value in deltas.items():
-                running[name] = running.get(name, 0) - value
-
         frames = []
-        for row, deltas in parsed:
-            for name, value in deltas.items():
-                running[name] = running.get(name, 0) + value
+        for row in rows:
+            totals = json.loads(row["totals"]) if row["totals"] is not None else {}
             frames.append(
                 {
                     "seq": row["seq"],
                     "operationId": row["operation_id"],
-                    "deltas": deltas,
-                    "totals": dict(running),
+                    "deltas": json.loads(row["payload"]),
+                    "totals": totals,
                 }
             )
         return frames
@@ -316,18 +362,14 @@ class Store:
                 status=acq["status"],
                 high_water=snap["high_water"],
                 totals=totals,
-                frames=self._retained_frames(acq["id"], totals),
+                frames=self._retained_frames(acq["id"]),
             )
 
     def frames_after(self, code: str, cursor: int) -> tuple[list[dict], int]:
         """返回 (seq > cursor 的留存帧, 留存的最小序号)。游标过旧时调用方据此发重置。"""
         with self._lock:
             acq = self._get_acquisition(code)
-            snap = self._conn.execute(
-                "SELECT totals FROM snapshots WHERE acquisition_id=?",
-                (acq["id"],),
-            ).fetchone()
-            retained = self._retained_frames(acq["id"], json.loads(snap["totals"]))
+            retained = self._retained_frames(acq["id"])
             lo_row = self._conn.execute(
                 "SELECT MIN(seq) AS lo FROM frames WHERE acquisition_id=?",
                 (acq["id"],),
